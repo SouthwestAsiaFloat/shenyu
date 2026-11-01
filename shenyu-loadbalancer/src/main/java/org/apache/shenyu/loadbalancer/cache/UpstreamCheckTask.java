@@ -28,9 +28,11 @@ import org.apache.shenyu.loadbalancer.entity.Upstream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -41,6 +43,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /**
@@ -58,6 +61,12 @@ public final class UpstreamCheckTask implements Runnable {
     private final Map<String, List<Upstream>> unhealthyUpstream = Maps.newConcurrentMap();
 
     private final Object lock = new Object();
+
+    private final Consumer<String> healthyUpstreamChanged;
+
+    private final Set<String> dirtySelectors = new HashSet<>();
+
+    private int updateDepth;
 
     private final AtomicBoolean checkStarted = new AtomicBoolean(false);
 
@@ -99,7 +108,12 @@ public final class UpstreamCheckTask implements Runnable {
      * @param checkInterval the check interval
      */
     public UpstreamCheckTask(final int checkInterval) {
+        this(checkInterval, selectorId -> { });
+    }
+
+    UpstreamCheckTask(final int checkInterval, final Consumer<String> healthyUpstreamChanged) {
         this.checkInterval = checkInterval;
+        this.healthyUpstreamChanged = healthyUpstreamChanged;
     }
     
     /**
@@ -189,15 +203,15 @@ public final class UpstreamCheckTask implements Runnable {
              */
             synchronized (lock) {
                 if (tryStartHealthCheck()) {
+                    updateDepth++;
                     try {
                         submitted = doHealthCheck(maxEndpointLatencyMillis);
                         pendingAtWait = countPendingFutures();
                         waitFinish();
                     } finally {
-                        // A round aborted between submit and wait (for example an executor rejection)
-                        // must not leak its futures into the next round, where they would be awaited
-                        // and applied a second time.
+                        // An aborted round must not leak futures into the next round.
                         futures.clear();
+                        finishUpdate();
                     }
                 }
             }
@@ -431,8 +445,10 @@ public final class UpstreamCheckTask implements Runnable {
      * @param upstream upstream
      */
     public void triggerRemoveOne(final String selectorId, final Upstream upstream) {
-        removeFromMap(healthyUpstream, selectorId, upstream);
-        removeFromMap(unhealthyUpstream, selectorId, upstream);
+        withLock(() -> {
+            removeFromMap(healthyUpstream, selectorId, upstream);
+            removeFromMap(unhealthyUpstream, selectorId, upstream);
+        });
     }
 
     /**
@@ -443,12 +459,15 @@ public final class UpstreamCheckTask implements Runnable {
      * @param upstream the upstream
      */
     public void putToMap(final Map<String, List<Upstream>> map, final String selectorId, final Upstream upstream) {
-        synchronized (lock) {
+        withLock(() -> {
             List<Upstream> list = MapUtils.computeIfAbsent(map, selectorId, k -> new CopyOnWriteArrayList<>());
             if (!list.contains(upstream)) {
                 list.add(upstream);
+                if (map == healthyUpstream) {
+                    dirtySelectors.add(selectorId);
+                }
             }
-        }
+        });
     }
 
     /**
@@ -459,12 +478,12 @@ public final class UpstreamCheckTask implements Runnable {
      * @param upstream the upstream
      */
     public void removeFromMap(final Map<String, List<Upstream>> map, final String selectorId, final Upstream upstream) {
-        synchronized (lock) {
+        withLock(() -> {
             List<Upstream> list = map.get(selectorId);
-            if (CollectionUtils.isNotEmpty(list)) {
-                list.remove(upstream);
+            if (CollectionUtils.isNotEmpty(list) && list.remove(upstream) && map == healthyUpstream) {
+                dirtySelectors.add(selectorId);
             }
-        }
+        });
     }
     
     /**
@@ -474,7 +493,25 @@ public final class UpstreamCheckTask implements Runnable {
      */
     void withLock(final Runnable action) {
         synchronized (lock) {
-            action.run();
+            updateDepth++;
+            try {
+                action.run();
+            } finally {
+                finishUpdate();
+            }
+        }
+    }
+
+    void markHealthyUpstreamChanged(final String selectorId) {
+        withLock(() -> dirtySelectors.add(selectorId));
+    }
+
+    private void finishUpdate() {
+        updateDepth--;
+        if (updateDepth == 0 && !dirtySelectors.isEmpty()) {
+            Set<String> changed = new HashSet<>(dirtySelectors);
+            dirtySelectors.clear();
+            changed.forEach(healthyUpstreamChanged);
         }
     }
 
@@ -484,10 +521,12 @@ public final class UpstreamCheckTask implements Runnable {
      * @param selectorId selectorId
      */
     public void triggerRemoveAll(final String selectorId) {
-        synchronized (lock) {
-            healthyUpstream.remove(selectorId);
+        withLock(() -> {
+            if (Objects.nonNull(healthyUpstream.remove(selectorId))) {
+                dirtySelectors.add(selectorId);
+            }
             unhealthyUpstream.remove(selectorId);
-        }
+        });
     }
     
     /**
